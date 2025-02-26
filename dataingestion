@@ -1,0 +1,160 @@
+
+import os
+import glob
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.types import *
+import configparser
+import logging
+import sys
+import shutil
+import psycopg2
+
+config_path = r'/home/spark/belladp/config'
+config_file = os.path.join(config_path,'bell_incentive.ini')
+config = configparser.ConfigParser()
+config.sections()
+config.read(config_file)
+
+#ddd
+
+creds_file =r'/home/spark/main_config/master_config_file.ini'
+#ddd
+
+#cred files
+creds = configparser.ConfigParser()
+creds.sections()
+creds.read(creds_file)
+dev_username = creds['postgres']['username']
+dev_password = creds['postgres']['password']
+
+
+log_path = config['path']['log_path']
+brs = config['postgres']['brs']
+dev_driver = config['postgres']['driver']
+
+job ='incentive'
+
+file_path=config['path']['file_path']
+dest_path=config['path']['dest_path']
+
+
+# check audit file
+
+def check_audit(file_list):
+	'''check for all the files in the path'''
+	all_files = {os.path.basename(i):datetime.fromtimestamp(os.path.getctime(i)).strftime('%Y-%m-%d') 
+	for i in file_list if datetime.fromtimestamp(os.path.getctime(i)).strftime('%Y-%m-%d') <= datetime.now().strftime('%Y-%m-%d')}
+	'''create a list that would contain all unloaded files'''
+	
+	unloaded_files = []
+	
+	try:
+		'''check if the file already exists in the audit file of loaded files'''
+		with open(os.path.join(log_path,'{}_audit.log'.format(job)),'r') as audit:
+			loaded_files = [i.replace('\n','').replace(' data','').replace(' payout','') for i in audit.readlines()]
+			for k in all_files.keys():
+				if k in loaded_files:
+					pass
+				else:
+					unloaded_files.append(k)
+		return unloaded_files
+	except FileNotFoundError as e:
+		print(e)
+		for k in all_files.keys():
+			unloaded_files.append(k)
+		return unloaded_files
+
+def get_header(csv):
+	header = []
+	with open(csv,'r') as get_:
+		header = [col.replace(' ','_').replace('\n','').replace('\\','').replace(':','').replace('[','').replace(']','').replace('/','').lower() for col in get_.readlines()[0].split(',') if col.replace(' ','') != '']
+	return header
+
+'''This Method checks if the file is an excel or csv, then converts to a DataFrame'''
+def process_files(filename,sheet_upload,header_index):
+	#show loading status
+	
+	schema_ = StructType().add('id',IntegerType(),True)
+
+	ext=filename.split('.')[-1]
+	if ext =='xlsx':
+		
+		df=pd.read_excel(filename,sheet_name=sheet_upload,header=header_index)
+		
+		df.to_csv('process.csv')
+		
+		headers = get_header('process.csv')
+		for col in headers:
+			schema_ = schema_.add(col,StringType(), True)
+
+		sparkdf = spark.read.format('csv').option('header',True).option('encoding','utf-8').schema(schema_).load('process.csv')
+		'''returns a tuple with two values; a spark dataframe and the filename'''
+		print('done processing file {0} tab {1}'.format(os.path.basename(filename).split('.')[0] , sheet_upload))
+		
+		return (sparkdf,os.path.basename(filename),sheet_upload)
+
+
+#ingest file
+def ingest_with_spark(data_tuple):
+	
+	try:
+		read_df,filename,sheet_upload = data_tuple[0],data_tuple[1],data_tuple[2].lower()
+		if read_df:
+			read_df.createOrReplaceTempView('read_df')
+			df=spark.sql("""select df.*,
+				now() as uploaded_date, '{0}' as filename
+				from read_df as df""".format(filename))
+			df.write.format("jdbc")\
+				.mode("append")\
+				.option('url',brs)\
+				.option("dbtable", 'bell_osl_incentive_{}_stg'.format(sheet_upload))\
+				.option("user", dev_username)\
+				.option("password", dev_password)\
+				.option("driver", dev_driver)\
+				.option("truncate",False)\
+				.save()
+			print('successfully ingested {}'.format(filename))
+			with open (os.path.join(log_path, '{}_audit.log'.format(job)),'a') as audit:
+				audit.write(filename +' ' + sheet_upload +'\n')
+			
+
+		else:
+			print("Dataframe is empty")
+			with open(os.path.join(log_path,'{}_audit.log'.format(job)),'a') as audit:
+				audit.write(filename  +' ' + sheet_upload + ' file is empty' +'\n')
+			
+	except BaseException as e:
+		print('Could not connect to Database...\n{}'.format(e))
+
+
+file_list=glob.glob(os.path.join(file_path,"*AGENTS_Incentive_payout*.*"))
+
+
+for file in file_list:
+    print(os.path.basename(file))
+
+spark = SparkSession.builder\
+      .master("local").appName("BellTest").getOrCreate()
+
+spark.sparkContext.setLogLevel('FATAL')
+log4jLogger = spark._jvm.org.apache.log4j
+LOGGER = log4jLogger.LogManager.getLogger(__name__)
+LOGGER.debug("initializing BellTest spark job..")
+
+
+
+for num,i in enumerate (check_audit(file_list)):
+    ingest_with_spark(process_files(os.path.join(file_path,i),"Data",[0]))
+    ingest_with_spark(process_files(os.path.join(file_path,i),"Payout",[1]))    
+
+    print('has loaded {0} items'.format(num+1))
+
+try: 
+	os.remove('process.csv')
+except: pass
+
+
+
