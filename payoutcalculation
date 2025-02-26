@@ -1,0 +1,158 @@
+import os
+import glob
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+from pyspark.sql import SparkSession
+from pyspark.sql.types import *
+import configparser
+import logging
+import sys
+import psycopg2
+import shutil
+from openpyxl import load_workbook
+import openpyxl
+
+
+config_path = r'/home/spark/belladp/config'
+config_file = os.path.join(config_path,'bell_incentive.ini')
+creds_file =r'/home/spark/main_config/master_config_file.ini'
+
+#config file
+config = configparser.ConfigParser()
+config.sections()
+config.read(config_file)
+log_path = config['path']['log_path']
+brs = config['postgres']['brs']
+dev_driver = config['postgres']['driver']
+dest_path=config['path']['dest_path']
+file_path=config['path']['file_path']
+
+#cred files
+creds = configparser.ConfigParser()
+creds.sections()
+creds.read(creds_file)
+dev_username = creds['postgres']['username']
+dev_password = creds['postgres']['password']
+
+
+job ='incentive'
+
+
+spark = SparkSession.builder\
+    .master("local").appName("Bell Incentive").getOrCreate()
+spark.sparkContext.setLogLevel('FATAL')
+log4jLogger = spark._jvm.org.apache.log4j
+LOGGER = log4jLogger.LogManager.getLogger(__name__)
+LOGGER.debug("initializing Bell Incentive spark job..")
+
+
+def get_newest_time(file_list):
+  return os.path.getctime(file_list)
+
+
+def check_file(file):
+   with open(os.path.join(log_path,'{}_audit.log'.format(job)),'r') as audit:
+      if (os.path.basename(file) +' work done'+'\n') in audit.readlines():
+         print('{} has been already worked on'.format(os.path.basename(file)))
+         return 0
+      else:
+         return file
+         
+def read_rate():
+  df=spark.read.format("jdbc")\
+    .option('url',brs)\
+    .option("dbtable", 'bell_osl_incentive_conversion_rate')\
+    .option("user", dev_username)\
+    .option("password", dev_password)\
+    .option("driver", dev_driver)\
+    .load()
+  df=df.toPandas()
+  return df
+
+
+def update_xlsx(dest, mapping_dict):
+    wb = load_workbook(filename = dest)
+    #Get the current Active Sheet
+    ws = wb['Payout']
+    for row in ws.iter_rows(min_row=3):
+      #based on conversion rate, change value in osl rate
+      ws.cell(row=row[17].row, column=22, value=mapping_dict.get(row[17].value, 0))
+    
+    wb.save(dest)
+    wb.close()
+    
+
+def write_pivot(dest):
+    wb = load_workbook(filename = dest)
+    ws = wb['Payout']
+    df = pd.DataFrame(ws.values)
+    header=df.iloc[1]
+    df=df[2:]
+    df.columns=header 
+    df['Total Payout']=df['Total Payout'].astype('float')
+    df['OSL Rate']=df['OSL Rate'].astype('float')
+    df['Qualified Bundles']=pd.to_numeric(df['Qualified Bundles'], errors='coerce')
+    df['Qualified Bundles']=df['Qualified Bundles'].fillna(0).astype(float)
+    df['OSL to Rep']=df['Qualified Bundles']*df['OSL Rate']
+    
+
+    ws = wb.create_sheet('Agent Payout Summary')
+    wb.save(dest)
+    wb.close()
+
+    print('sheet created')
+    # Create a pivot table
+    pivot_table=df.pivot_table(index='Pein',values=['Total Payout','OSL to Rep'], aggfunc=sum, margins=True)
+
+    writer = pd.ExcelWriter(dest, engine='openpyxl') 
+    #define existing workbook and sheets into writer and manipulate inside the scope
+    writer.book = wb
+    writer.sheets = dict((ws.title, ws) for ws in wb.worksheets)
+    pivot_table.to_excel(writer, sheet_name='Agent Payout Summary', header=True)
+    writer.save()
+    with open (os.path.join(log_path, '{}_audit.log'.format(job)),'a') as audit:
+         audit.write(os.path.basename(dest) +' work done' +'\n')
+    print(os.path.basename(dest) + ' is completed')
+
+#change file name based on actual pay date
+def mod_name(dest):
+  name_list=os.path.basename(dest).split('_')
+  date_=name_list[-1].split('.')[0]
+  date_mod=(datetime.strptime(date_, '%b%d') + timedelta(days=7)).strftime('%b%d')+'.xlsx'
+  new_name=name_list.copy()
+  new_name[-1]=date_mod
+  new_name='_'.join(new_name)
+  new_name=os.path.join(os.path.dirname(dest),new_name)
+  os.rename(dest,new_name)
+
+def main():
+    
+  file_list=glob.glob(os.path.join(file_path,'*AGENTS_Incentive_payout*.*'))
+  file_to_check=max(file_list, key=get_newest_time)
+  
+  #check if file has been worked on from the input folder, if not, move to output folder first 
+  if check_file(file_to_check):
+    shutil.copy2(os.path.join(file_path,os.path.basename(file_to_check)),os.path.join(dest_path,os.path.basename(file_to_check)))
+    file_to_work=os.path.join(dest_path,os.path.basename(file_to_check))
+
+    print('now processing file: '.format(os.path.basename(file_to_work)))
+    rate=read_rate()
+    mapping_dict = dict(zip(rate['bell_to_osl'], rate['osl_to_rep']))
+
+    update_xlsx(file_to_work,mapping_dict)
+    write_pivot(file_to_work)
+    mod_name(file_to_work)
+  else:
+    print('no file has been worked on')
+      
+
+  
+
+
+
+if __name__ == '__main__':
+  main()
+
+
+
